@@ -30,10 +30,22 @@ import time
 
 # Available iperf3 servers with their ports
 IPERF3_SERVERS = {
-    "ping.online.net": {"description": "Scaleway France", "port": 5200},
-    "speedtest.milkywan.fr": {"description": "CBO France", "port": 9200}, 
-    "str.cubic.iperf.bytel.fr": {"description": "Bouygues France", "port": 9200},
-    "ch.iperf.014.fr": {"description": "HostHatch Switzerland", "port": 15315}
+    "ping.online.net": {
+        "description": "Scaleway France", 
+        "ports": list(range(5200, 5210))  # 5200-5209
+    },
+    "speedtest.milkywan.fr": {
+        "description": "CBO France", 
+        "ports": list(range(9200, 9241))  # 9200-9240
+    }, 
+    "str.cubic.iperf.bytel.fr": {
+        "description": "Bouygues France", 
+        "ports": list(range(9200, 9241))  # 9200-9240
+    },
+    "ch.iperf.014.fr": {
+        "description": "HostHatch Switzerland", 
+        "ports": list(range(15315, 15321))  # 15315-15320
+    }
 }
 
 try:
@@ -60,36 +72,100 @@ except ImportError:
     sys.exit(1)
 
 
-def test_server_connectivity(server: str, port: int, timeout: int = 5) -> bool:
+def test_server_connectivity(server: str, port: int, timeout: int = 3) -> bool:
     """
-    Test if an iperf3 server is responding by attempting a quick connection.
+    Test if a port is open and accepting connections using a simple socket test.
+    This is much faster and more reliable than running full iperf3 tests.
     """
     try:
-        cmd = ["iperf3", "-c", server, "-p", str(port), "-t", "1", "--json"]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((server, port))
+        sock.close()
+        return result == 0  # 0 means connection successful
+    except Exception:
+        return False
+
+
+def test_udp_support(server: str, port: int, timeout: int = 5) -> bool:
+    """
+    Test if server supports UDP iperf3 tests by running a very short test.
+    """
+    try:
+        cmd = ["iperf3", "-c", server, "-p", str(port), "-u", "-b", "1M", "-t", "1", "--json"]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout)
-        return result.returncode == 0
+        if result.returncode == 0:
+            # Parse JSON to check if we got valid UDP results
+            try:
+                data = json.loads(result.stdout)
+                summary = data.get("end", {}).get("sum", {})
+                return (summary.get("jitter_ms") is not None and 
+                       summary.get("lost_packets") is not None and 
+                       summary.get("packets") is not None)
+            except (json.JSONDecodeError, KeyError):
+                return False
+        return False
     except (subprocess.TimeoutExpired, Exception):
         return False
 
 
 def select_best_server() -> tuple:
     """
-    Test available servers and return the first responsive one as (server, port).
+    Test available servers and return the first one with both TCP and UDP support.
+    Falls back to TCP-only servers if no UDP support is found.
     """
     print("Testing iperf3 server connectivity...")
-    for server, config in IPERF3_SERVERS.items():
-        port = config["port"]
-        description = config["description"]
-        print(f"  Testing {server}:{port} ({description})...", end=" ")
-        if test_server_connectivity(server, port):
-            print("✓")
-            return server, port
-        else:
-            print("✗")
     
-    # If none respond, return the first one anyway
+    # First pass: look for servers with both TCP and UDP support
+    for server, config in IPERF3_SERVERS.items():
+        description = config["description"]
+        ports = config["ports"]
+        
+        print(f"  Testing {server} ({description}) on ports {ports[0]}-{ports[-1]}...")
+        
+        # Try each port until we find one that works
+        for port in ports:
+            print(f"    Trying port {port}...", end=" ")
+            
+            # Test TCP connectivity first
+            if test_server_connectivity(server, port, timeout=3):
+                print("TCP ✓", end=" ")
+                
+                # Test UDP support
+                print("UDP...", end=" ")
+                if test_udp_support(server, port, timeout=5):
+                    print("✓")
+                    print(f"  → Selected {server}:{port} (TCP + UDP support)")
+                    return server, port
+                else:
+                    print("✗")
+                    print(f"    Port {port}: TCP works but no UDP support")
+            else:
+                print("TCP ✗")
+        
+        print(f"  → No working ports found on {server}")
+    
+    print("\n  No servers with UDP support found. Trying TCP-only servers...")
+    
+    # Second pass: fallback to TCP-only servers
+    for server, config in IPERF3_SERVERS.items():
+        description = config["description"]
+        ports = config["ports"]
+        
+        print(f"  Testing {server} ({description}) for TCP-only...")
+        
+        for port in ports:
+            print(f"    Trying port {port}...", end=" ")
+            if test_server_connectivity(server, port, timeout=3):
+                print("✓")
+                print(f"  → Selected {server}:{port} (TCP only - UDP may fail)")
+                return server, port
+            else:
+                print("✗")
+    
+    # If none respond, return the first server and first port anyway
     fallback_server = list(IPERF3_SERVERS.keys())[0]
-    fallback_port = IPERF3_SERVERS[fallback_server]["port"]
+    fallback_port = IPERF3_SERVERS[fallback_server]["ports"][0]
     print(f"  No servers responded, using fallback: {fallback_server}:{fallback_port}")
     return fallback_server, fallback_port
 
@@ -100,9 +176,13 @@ def list_servers():
     """
     print("Available iperf3 servers:")
     for server, config in IPERF3_SERVERS.items():
-        port = config["port"]
         description = config["description"]
-        print(f"  {server:<30} - {description} (port {port})")
+        ports = config["ports"]
+        if len(ports) == 1:
+            port_display = f"port {ports[0]}"
+        else:
+            port_display = f"ports {ports[0]}-{ports[-1]}"
+        print(f"  {server:<30} - {description} ({port_display})")
 
 
 def measure_ping(target: str, interval: float, duration: float):
@@ -390,13 +470,49 @@ def main():
         iperf_server = args.iperf3_server
         # Check if server is in our list to get the port
         if iperf_server in IPERF3_SERVERS:
-            iperf_port = IPERF3_SERVERS[iperf_server]["port"]
+            # Test the server's ports to find a working one
+            config = IPERF3_SERVERS[iperf_server]
+            ports = config["ports"]
+            description = config["description"]
+            print(f"Testing specified server {iperf_server} ({description})...")
+            
+            working_port = None
+            udp_support = False
+            
+            for port in ports:
+                print(f"  Trying port {port}...", end=" ")
+                if test_server_connectivity(iperf_server, port, timeout=3):
+                    print("TCP ✓", end=" ")
+                    
+                    # Test UDP support
+                    print("UDP...", end=" ")
+                    if test_udp_support(iperf_server, port, timeout=5):
+                        print("✓")
+                        working_port = port
+                        udp_support = True
+                        break
+                    else:
+                        print("✗")
+                        if working_port is None:  # Keep first working TCP port as fallback
+                            working_port = port
+                else:
+                    print("TCP ✗")
+            
+            if working_port:
+                iperf_port = working_port
+                if udp_support:
+                    print(f"Using {iperf_server}:{iperf_port} (TCP + UDP support)")
+                else:
+                    print(f"Using {iperf_server}:{iperf_port} (TCP only - UDP tests may fail)")
+            else:
+                iperf_port = ports[0]  # Use first port as fallback
+                print(f"No ports responded, using fallback {iperf_server}:{iperf_port}")
         else:
             iperf_port = 5201  # Default iperf3 port
-        print(f"Using specified iperf3 server: {iperf_server}:{iperf_port}")
+            print(f"Using specified iperf3 server: {iperf_server}:{iperf_port}")
+            print("Note: Custom server - UDP support unknown")
     else:
         iperf_server, iperf_port = select_best_server()
-        print(f"Auto-selected iperf3 server: {iperf_server}:{iperf_port}")
 
     buf = bufferbloat_test(iperf_server, iperf_port, args.ping_host)
     jitter = jitter_test(iperf_server, iperf_port)
