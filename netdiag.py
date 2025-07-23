@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import platform
+import queue
 import random
 import shutil
 import socket
@@ -322,20 +323,32 @@ def jitter_test(server: str, port: int, duration: int = 10, bw: str = "100M"):
 
 def mtr_test(target: str = "8.8.8.8", count: int = 100):
     """
-    Run mtr -r -c count target and parse output for any hop loss or spikes.
+    Run mtr -r -c count target and parse output for comprehensive hop analysis.
+    Enhanced for ISP troubleshooting with detailed statistics.
     """
     print("\n=== MTR Test ===")
     mtr_bin = shutil.which("mtr")
     if not mtr_bin:
         print("  mtr not installed; skipping.")
+        print("  Install with: brew install mtr (macOS) or apt install mtr (Linux)")
         return None
+    
+    print(f"  Running MTR to {target} with {count} packets...")
     cmd = [mtr_bin, "-r", "-c", str(count), target]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, universal_newlines=True)
         lines = out.strip().splitlines()
+        
+        if len(lines) < 2:
+            print("  ERROR: No MTR data received")
+            return None
+            
         header = lines[0]
         print("  " + header)
+        
         hops = []
+        problem_hops = []
+        
         for line in lines[1:]:
             parts = line.split()
             if len(parts) >= 8 and parts[0].isdigit():
@@ -343,14 +356,56 @@ def mtr_test(target: str = "8.8.8.8", count: int = 100):
                 loss = float(parts[1].strip("%"))
                 avg = float(parts[4])
                 stdev = float(parts[7])
+                
+                # Additional MTR fields for comprehensive analysis
+                sent = int(parts[2]) if len(parts) > 2 else count
+                last = float(parts[3]) if len(parts) > 3 else avg
+                best = float(parts[5]) if len(parts) > 5 else avg
+                worst = float(parts[6]) if len(parts) > 6 else avg
+                
+                hop_data = {
+                    'hop': hop,
+                    'loss': loss,
+                    'avg': avg,
+                    'stdev': stdev,
+                    'last': last,
+                    'best': best,
+                    'worst': worst,
+                    'sent': sent
+                }
+                
                 hops.append((hop, loss, avg, stdev))
-                flag = ""
-                if loss > 0 or stdev > 10:
-                    flag = "  <<<"
-                print(f"  {line}{flag}")
+                
+                # Flag problematic hops for ISP evidence
+                flags = []
+                if loss > 0:
+                    flags.append("🔴 LOSS")
+                    problem_hops.append(f"Hop {hop}: {loss:.1f}% packet loss")
+                if stdev > 20:  # High jitter threshold
+                    flags.append("🟡 HIGH-JITTER")
+                    problem_hops.append(f"Hop {hop}: {stdev:.1f}ms jitter")
+                if worst - best > 100:  # High latency variation
+                    flags.append("🟠 LATENCY-VAR")
+                    problem_hops.append(f"Hop {hop}: {worst-best:.1f}ms latency variation")
+                
+                flag_str = " " + " ".join(flags) if flags else ""
+                print(f"  {line}{flag_str}")
+                
+        # Summary for ISP troubleshooting
+        if problem_hops:
+            print(f"\n  ⚠️  PROBLEMS DETECTED ({len(problem_hops)} issues):")
+            for problem in problem_hops:
+                print(f"     {problem}")
+        else:
+            print(f"\n  ✅ All {len(hops)} hops look healthy")
+            
         return hops
+        
+    except subprocess.CalledProcessError as e:
+        print(f"  ERROR: MTR command failed (exit code {e.returncode})")
+        return None
     except Exception as e:
-        print("  ERROR running mtr:", e)
+        print(f"  ERROR running MTR: {e}")
         return None
 
 
@@ -477,11 +532,40 @@ def main():
                    help="List available iperf3 servers and exit")
     p.add_argument("--ping-host", default="8.8.8.8",
                    help="Host to ping for bufferbloat (default 8.8.8.8)")
+    p.add_argument("--runs", type=int, default=5,
+                   help="Number of test runs to perform (default: 5 for comprehensive analysis)")
+    p.add_argument("--parallel", type=int, default=1,
+                   help="Number of parallel test threads (default: 1)")
+    p.add_argument("--output", type=str, default="network_diagnostics.txt",
+                   help="Save detailed results to file (default: network_diagnostics.txt)")
+    p.add_argument("--mtr-count", type=int, default=200,
+                   help="Number of MTR packets to send (default: 200 for thorough analysis)")
+    p.add_argument("--quick", action="store_true",
+                   help="Quick single run mode (disables multiple runs and logging)")
     args = p.parse_args()
 
     if args.list_servers:
         list_servers()
         return
+
+    # Quick mode for fast testing
+    if args.quick:
+        args.runs = 1
+        args.parallel = 1
+        args.output = None
+        args.mtr_count = 100
+        print("=== Quick Mode: Single Test Run ===")
+    else:
+        print("=== Comprehensive Mode: Multiple Runs for ISP Evidence ===")
+        print(f"Running {args.runs} tests, saving results to {args.output}")
+        print("Use --quick for single fast test, or --help for all options")
+
+    # Initialize logging if output file specified
+    log_file = None
+    if args.output:
+        log_file = open(args.output, 'w')
+        log_file.write(f"Network Diagnostics Report - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write("=" * 60 + "\n\n")
 
     # Select iperf3 server
     if args.iperf3_server:
@@ -532,37 +616,290 @@ def main():
     else:
         iperf_server, iperf_port = select_best_server()
 
-    buf = bufferbloat_test(iperf_server, iperf_port, args.ping_host)
-    jitter = jitter_test(iperf_server, iperf_port)
-    mtr = mtr_test()
-    mtu = mtu_test()
-    dns = dns_test()
-    cgnat = cgnat_test()
+    # Run tests (single or multiple runs)
+    if args.runs == 1:
+        # Single run mode
+        print(f"\n=== Running Single Diagnostic Test ===")
+        results = run_single_test(iperf_server, iperf_port, args.ping_host, args.mtr_count, log_file)
+        display_final_summary(results, log_file)
+    else:
+        # Multiple runs mode with intelligent batching
+        print(f"\n=== Running {args.runs} Tests for Comprehensive Analysis ===")
+        
+        # Auto-enable parallel for stress testing if many runs
+        effective_parallel = args.parallel
+        if args.runs >= 6 and args.parallel == 1:
+            effective_parallel = 2
+            print(f"Auto-enabling parallel execution ({effective_parallel} threads) for stress testing")
+        
+        all_results = run_multiple_tests(iperf_server, iperf_port, args.ping_host, args.mtr_count, 
+                                       args.runs, effective_parallel, log_file)
+        display_statistical_summary(all_results, log_file)
 
-    # Final summary
+    if log_file:
+        log_file.close()
+        print(f"\n📄 Detailed results saved to: {args.output}")
+        print("💡 Use this file as evidence when contacting your ISP about network issues")
+
+
+def run_single_test(iperf_server, iperf_port, ping_host, mtr_count, log_file):
+    """Run a single complete diagnostic test."""
+    results = {}
+    
+    results['bufferbloat'] = bufferbloat_test(iperf_server, iperf_port, ping_host)
+    results['jitter'] = jitter_test(iperf_server, iperf_port)
+    results['mtr'] = mtr_test(count=mtr_count)
+    results['mtu'] = mtu_test()
+    results['dns'] = dns_test()
+    results['cgnat'] = cgnat_test()
+    
+    if log_file:
+        log_test_results(results, log_file, run_number=1)
+    
+    return results
+
+
+def run_multiple_tests(iperf_server, iperf_port, ping_host, mtr_count, num_runs, parallel, log_file):
+    """Run multiple diagnostic tests and collect statistics."""
+    all_results = []
+    results_queue = queue.Queue()
+    
+    def run_test_worker(run_id):
+        print(f"  Run {run_id}: Starting...")
+        try:
+            results = run_single_test(iperf_server, iperf_port, ping_host, mtr_count, log_file)
+            results['run_id'] = run_id
+            results_queue.put(results)
+            print(f"  Run {run_id}: Complete")
+        except Exception as e:
+            print(f"  Run {run_id}: Failed - {e}")
+            results_queue.put({'run_id': run_id, 'error': str(e)})
+    
+    # Run tests in batches if parallel > 1
+    remaining_runs = list(range(1, num_runs + 1))
+    
+    while remaining_runs:
+        # Create batch of parallel runs
+        batch_size = min(parallel, len(remaining_runs))
+        current_batch = remaining_runs[:batch_size]
+        remaining_runs = remaining_runs[batch_size:]
+        
+        # Start threads for current batch
+        threads = []
+        for run_id in current_batch:
+            thread = threading.Thread(target=run_test_worker, args=(run_id,))
+            thread.start()
+            threads.append(thread)
+        
+        # Wait for batch to complete
+        for thread in threads:
+            thread.join()
+    
+    # Collect all results
+    while not results_queue.empty():
+        all_results.append(results_queue.get())
+    
+    return sorted(all_results, key=lambda x: x.get('run_id', 0))
+
+
+def log_test_results(results, log_file, run_number):
+    """Log detailed test results to file."""
+    log_file.write(f"=== Test Run {run_number} ===\n")
+    log_file.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    # Log each test result
+    for test_name, result in results.items():
+        if result:
+            log_file.write(f"{test_name.upper()} Results:\n")
+            log_file.write(f"{json.dumps(result, indent=2)}\n\n")
+    
+    log_file.write("-" * 40 + "\n\n")
+    log_file.flush()
+
+
+def display_statistical_summary(all_results, log_file):
+    """Display comprehensive statistics across all test runs."""
+    print("\n" + "=" * 60)
+    print("STATISTICAL SUMMARY")
+    print("=" * 60)
+    
+    # Extract successful results (filter out errors)
+    valid_results = [r for r in all_results if 'error' not in r]
+    failed_runs = [r for r in all_results if 'error' in r]
+    
+    if failed_runs:
+        print(f"⚠️  {len(failed_runs)} of {len(all_results)} runs failed")
+        for failed in failed_runs:
+            print(f"   Run {failed['run_id']}: {failed['error']}")
+        print()
+    
+    if not valid_results:
+        print("❌ No successful test runs to analyze")
+        return
+    
+    print(f"📊 Analyzing {len(valid_results)} successful runs")
+    print()
+    
+    # Bufferbloat statistics
+    analyze_bufferbloat_stats(valid_results)
+    
+    # Jitter statistics  
+    analyze_jitter_stats(valid_results)
+    
+    # DNS statistics
+    analyze_dns_stats(valid_results)
+    
+    # MTR statistics (enhanced)
+    analyze_mtr_stats(valid_results)
+    
+    if log_file:
+        log_file.write("STATISTICAL SUMMARY\n")
+        log_file.write("=" * 40 + "\n")
+        log_file.write(f"Successful runs: {len(valid_results)}\n")
+        log_file.write(f"Failed runs: {len(failed_runs)}\n\n")
+
+
+def analyze_bufferbloat_stats(results):
+    """Analyze bufferbloat test statistics across multiple runs."""
+    baseline_rtts = []
+    upload_increases = []
+    download_increases = []
+    grades = []
+    
+    for result in results:
+        buf = result.get('bufferbloat')
+        if buf:
+            if buf.get('baseline_avg'):
+                baseline_rtts.append(buf['baseline_avg'])
+            if buf.get('upload_avg') and buf.get('baseline_avg'):
+                upload_increases.append(buf['upload_avg'] - buf['baseline_avg'])
+            if buf.get('download_avg') and buf.get('baseline_avg'):
+                download_increases.append(buf['download_avg'] - buf['baseline_avg'])
+            if buf.get('grade'):
+                grades.append(buf['grade'])
+    
+    print("🌐 BUFFERBLOAT ANALYSIS")
+    if baseline_rtts:
+        print(f"   Baseline RTT: {min(baseline_rtts):.1f} - {max(baseline_rtts):.1f} ms (avg: {statistics.mean(baseline_rtts):.1f})")
+    if upload_increases:
+        print(f"   Upload impact: {min(upload_increases):.1f} - {max(upload_increases):.1f} ms (avg: {statistics.mean(upload_increases):.1f})")
+    if download_increases:
+        print(f"   Download impact: {min(download_increases):.1f} - {max(download_increases):.1f} ms (avg: {statistics.mean(download_increases):.1f})")
+    if grades:
+        grade_counts = {g: grades.count(g) for g in set(grades)}
+        print(f"   Grades: {grade_counts}")
+    print()
+
+
+def analyze_jitter_stats(results):
+    """Analyze jitter test statistics across multiple runs.""" 
+    jitters = []
+    loss_rates = []
+    
+    for result in results:
+        jitter = result.get('jitter')
+        if jitter:
+            if jitter.get('jitter_ms'):
+                jitters.append(jitter['jitter_ms'])
+            if jitter.get('lost') is not None and jitter.get('total'):
+                loss_rate = (jitter['lost'] / jitter['total']) * 100
+                loss_rates.append(loss_rate)
+    
+    print("📡 JITTER & PACKET LOSS ANALYSIS")
+    if jitters:
+        print(f"   Jitter: {min(jitters):.1f} - {max(jitters):.1f} ms (avg: {statistics.mean(jitters):.1f})")
+    if loss_rates:
+        print(f"   Packet loss: {min(loss_rates):.3f}% - {max(loss_rates):.3f}% (avg: {statistics.mean(loss_rates):.3f}%)")
+    print()
+
+
+def analyze_dns_stats(results):
+    """Analyze DNS lookup statistics across multiple runs."""
+    dns_times = {'1.1.1.1': [], '8.8.8.8': []}
+    
+    for result in results:
+        dns = result.get('dns')
+        if dns:
+            for resolver, time_ms in dns.items():
+                if time_ms is not None and resolver in dns_times:
+                    dns_times[resolver].append(time_ms)
+    
+    print("🔍 DNS LOOKUP ANALYSIS")
+    for resolver, times in dns_times.items():
+        if times:
+            print(f"   {resolver}: {min(times):.1f} - {max(times):.1f} ms (avg: {statistics.mean(times):.1f})")
+    print()
+
+
+def analyze_mtr_stats(results):
+    """Enhanced MTR analysis with hop-by-hop statistics."""
+    print("🛣️  MTR ROUTE ANALYSIS")
+    
+    # Collect all MTR results
+    all_hops = {}  # hop_number -> list of (loss, avg_rtt, stdev)
+    
+    for result in results:
+        mtr = result.get('mtr')
+        if mtr:
+            for hop, loss, avg, stdev in mtr:
+                if hop not in all_hops:
+                    all_hops[hop] = []
+                all_hops[hop].append((loss, avg, stdev))
+    
+    if not all_hops:
+        print("   No MTR data available")
+        return
+    
+    print("   Hop-by-hop analysis:")
+    for hop in sorted(all_hops.keys()):
+        hop_data = all_hops[hop]
+        losses = [d[0] for d in hop_data]
+        rtts = [d[1] for d in hop_data]
+        stdevs = [d[2] for d in hop_data]
+        
+        max_loss = max(losses)
+        avg_rtt = statistics.mean(rtts)
+        max_stdev = max(stdevs)
+        
+        status = ""
+        if max_loss > 0:
+            status += " 🔴 LOSS"
+        if max_stdev > 10:
+            status += " 🟡 JITTER"
+        if not status:
+            status = " ✅"
+            
+        print(f"   Hop {hop:2d}: {avg_rtt:6.1f}ms avg, {max_loss:4.1f}% max loss, {max_stdev:5.1f}ms max jitter{status}")
+    
+    print()
+
+
+def display_final_summary(results, log_file):
+    """Display final summary for single test run."""
     print("\n=== SUMMARY ===")
     ok = True
-    if buf and buf.get("grade", "C") not in ("A", "B"):
-        print(f"Bufferbloat grade {buf.get('grade')} → PROBLEM")
+    if results.get('bufferbloat') and results['bufferbloat'].get("grade", "C") not in ("A", "B"):
+        print(f"Bufferbloat grade {results['bufferbloat'].get('grade')} → PROBLEM")
         ok = False
-    if jitter and jitter.get("status") != "OK":
+    if results.get('jitter') and results['jitter'].get("status") != "OK":
         print("Jitter test WARN → PROBLEM")
         ok = False
-    if mtr:
+    if results.get('mtr'):
         # any hop with loss?
-        for hop, loss, avg, sd in mtr:
+        for hop, loss, avg, sd in results['mtr']:
             if loss > 0:
                 print(f"MTR hop {hop} has {loss:.1f}% loss → PROBLEM")
                 ok = False
                 break
-    if mtu and mtu < 1400:
+    if results.get('mtu') and results['mtu'] < 1400:
         print("MTU very low → PROBLEM")
         ok = False
-    for r, d in dns.items():
-        if d is None or d > 200:
-            print(f"DNS {r} lookup slow/failing → PROBLEM")
-            ok = False
-    if cgnat and cgnat.get("cgnat"):
+    if results.get('dns'):
+        for r, d in results['dns'].items():
+            if d is None or d > 200:
+                print(f"DNS {r} lookup slow/failing → PROBLEM")
+                ok = False
+    if results.get('cgnat') and results['cgnat'].get("cgnat"):
         print("Carrier-Grade NAT detected → may break inbound connections")
         # not necessarily "fail", but note it
     if ok:
