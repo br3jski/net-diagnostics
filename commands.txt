@@ -1,0 +1,2 @@
+sudo apt install iperf3 mtr      # on Debian/Ubuntu
+brew install iperf3 mtr          # on macOS via Homebrew

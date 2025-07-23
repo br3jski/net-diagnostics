@@ -1,0 +1,4 @@
+ping3
+dnspython
+miniupnpc
+requests
