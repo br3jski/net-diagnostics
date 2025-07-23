@@ -219,12 +219,24 @@ def jitter_test(server: str, port: int, duration: int = 10, bw: str = "100M"):
         jitter = summary.get("jitter_ms")
         lost = summary.get("lost_packets")
         total = summary.get("packets")
+        
+        # Handle None values with proper fallbacks
+        if jitter is None or lost is None or total is None:
+            print("  ERROR: Incomplete UDP test results from server")
+            return None
+            
         print(f"  Jitter: {jitter:.1f} ms; Lost: {lost}/{total}")
         status = "OK" if jitter < 20 and lost == 0 else "WARN"
         print(f"  Status: {status}")
         return {"jitter_ms": jitter, "lost": lost, "total": total, "status": status}
+    except subprocess.CalledProcessError as e:
+        print(f"  ERROR: iperf3 UDP test failed (exit code {e.returncode})")
+        return None
+    except json.JSONDecodeError:
+        print("  ERROR: Invalid JSON response from iperf3 UDP test")
+        return None
     except Exception as e:
-        print("  ERROR running iperf3 UDP:", e)
+        print(f"  ERROR running iperf3 UDP: {e}")
         return None
 
 
