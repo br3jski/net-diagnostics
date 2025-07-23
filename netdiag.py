@@ -439,15 +439,33 @@ def cgnat_test():
     try:
         upnp = miniupnpc.UPnP()
         upnp.discoverdelay = 200
-        upnp.discover()
+        discovered = upnp.discover()
+        if discovered == 0:
+            print("  No UPnP devices found on network")
+            return {"public_ip": public_ip, "router_ip": None, "cgnat": None}
+        
         upnp.selectigd()
         router_ext = upnp.externalipaddress()
+        
+        if not router_ext or router_ext == "0.0.0.0":
+            print("  Router UPnP available but no external IP reported")
+            return {"public_ip": public_ip, "router_ip": None, "cgnat": None}
+            
         print(f"  Router-reported external IP = {router_ext}")
         cgnat = (router_ext != public_ip)
         print("  CG-NAT Detected!" if cgnat else "  Public IP matches router → No CG-NAT")
         return {"public_ip": public_ip, "router_ip": router_ext, "cgnat": cgnat}
+        
     except Exception as e:
-        print("  ERROR querying UPnP:", e)
+        error_msg = str(e).lower()
+        if "success" in error_msg:
+            print("  UPnP query completed but router configuration unavailable")
+        elif "no igd found" in error_msg:
+            print("  No UPnP Internet Gateway Device found")
+        elif "timeout" in error_msg or "connection" in error_msg:
+            print("  UPnP connection timeout - router may not support UPnP")
+        else:
+            print(f"  UPnP query failed: {e}")
         return {"public_ip": public_ip, "router_ip": None, "cgnat": None}
 
 
